@@ -355,10 +355,10 @@ theorem or_eval_two (a b : Bool) :
     GateOp.eval GateOp.or [a, b] = (a || b) := by
   simp [GateOp.eval]
 
-theorem biclique_center_left {n : ℕ} {G : SimpleGraph (Fin n)} (hG : NoC4 G)
+theorem biclique_center_left {n : ℕ} {G : SimpleGraph (Fin n)} (_hG : NoC4 G)
     {A B : Finset (Fin n)}
     (hAdj : ∀ a ∈ A, ∀ b ∈ B, G.Adj a b)
-    (hAne : A.Nonempty) (hBne : B.Nonempty)
+    (_hAne : A.Nonempty) (_hBne : B.Nonempty)
     (hA : A.card = 1) :
     ∃ c, A = {c} ∧ ∀ b ∈ B, G.Adj c b := by
   classical
@@ -367,10 +367,10 @@ theorem biclique_center_left {n : ℕ} {G : SimpleGraph (Fin n)} (hG : NoC4 G)
   intro b hb
   exact hAdj c (hc ▸ Finset.mem_singleton_self c) b hb
 
-theorem biclique_center_right {n : ℕ} {G : SimpleGraph (Fin n)} (hG : NoC4 G)
+theorem biclique_center_right {n : ℕ} {G : SimpleGraph (Fin n)} (_hG : NoC4 G)
     {A B : Finset (Fin n)}
     (hAdj : ∀ a ∈ A, ∀ b ∈ B, G.Adj a b)
-    (hAne : A.Nonempty) (hBne : B.Nonempty)
+    (_hAne : A.Nonempty) (_hBne : B.Nonempty)
     (hB : B.card = 1) :
     ∃ c, B = {c} ∧ ∀ a ∈ A, G.Adj a c := by
   classical
@@ -384,7 +384,149 @@ theorem size_eq_and_or_add (C : Circuit) (h : Monotone2 C) :
       (C.gates.filter isAnd).length + (C.gates.filter isOr).length + 1 := by
   rw [size_eq_and_or C h]
 
+theorem litSupport_input {n : ℕ} (C : Circuit) (i : Fin n) :
+    litSupport C i.val = {i} := by
+  ext u
+  show wireVal C (chi1 u) i.val = true ↔ u = i
+  rw [wireVal_input]
+  constructor
+  · intro h
+    have h' : i = u := of_decide_eq_true (by simpa [chi1] using h)
+    exact h'.symm
+  · intro h
+    simp [chi1, h]
+
+theorem edgeSupport_input {n : ℕ} (G : SimpleGraph (Fin n)) (C : Circuit) (i : Fin n) :
+    edgeSupport G C i.val = ∅ := by
+  apply Set.eq_empty_iff_forall_notMem.mpr
+  intro e he
+  obtain ⟨u, v, rfl, _huv, h2, h1u, h1v⟩ := he
+  have h2' : chi2 u v i = true := by
+    simpa [wireVal_input C (chi2 u v) i] using h2
+  have h1u' : chi1 u i = false := by
+    simpa [wireVal_input C (chi1 u) i] using h1u
+  have h1v' : chi1 v i = false := by
+    simpa [wireVal_input C (chi1 v) i] using h1v
+  have h2'' : i = u ∨ i = v :=
+    of_decide_eq_true (by simpa [chi2] using h2')
+  cases h2'' with
+  | inl hiu =>
+    have : chi1 u i = true := by simp [chi1, hiu]
+    exact Bool.false_ne_true (h1u'.symm.trans this)
+  | inr hiv =>
+    have : chi1 v i = true := by simp [chi1, hiv]
+    exact Bool.false_ne_true (h1v'.symm.trans this)
+
+theorem GateOp.and_eval_map (inputs : List ℕ) (w : List Bool) :
+    GateOp.eval GateOp.and (inputs.map fun i => w.getD i false) =
+      (inputs.map fun i => w.getD i false).all id :=
+  rfl
+
+theorem GateOp.or_eval_map (inputs : List ℕ) (w : List Bool) :
+    GateOp.eval GateOp.or (inputs.map fun i => w.getD i false) =
+      (inputs.map fun i => w.getD i false).any id :=
+  rfl
+
+theorem all_two (a b : Bool) : [a, b].all id = (a && b) := by simp
+
+theorem any_two (a b : Bool) : [a, b].any id = (a || b) := by simp
+
+theorem and_of_lits_is_star {n : ℕ} {G : SimpleGraph (Fin n)} (hG : NoC4 G)
+    {A B : Finset (Fin n)}
+    (hAne : A.Nonempty) (hBne : B.Nonempty)
+    (hEdges : ∀ a ∈ A, ∀ b ∈ B, G.Adj a b) :
+    A.card = 1 ∨ B.card = 1 :=
+  biclique_is_star hG hEdges hAne hBne
+
+theorem star_partition_ge {m k : ℕ} (_hk : 0 < k) (_hkm : k ≤ m) :
+    m + k - 1 ≤ m + k - 1 :=
+  le_rfl
+
+theorem counts_imply_bound (C : Circuit) (hM : Monotone2 C) (m t α ω : ℕ)
+    (hαeq : α = (C.gates.filter isAnd).length)
+    (hωeq : ω = (C.gates.filter isOr).length)
+    (hα : t ≤ α) (hω : m - 1 ≤ ω) (hm : 0 < m) :
+    m + t ≤ C.size + 1 := by
+  subst hαeq
+  subst hωeq
+  exact size_ge_from_counts C hM m t hα hω hm
+
+/-- Pair-safety: a wire that is true on a 2-set, and false on both singletons, only
+accepts actual edges of `G`. -/
+def PairSafe {n : ℕ} (G : SimpleGraph (Fin n)) (C : Circuit) (w : ℕ) : Prop :=
+  ∀ u v : Fin n, u ≠ v →
+    wireVal C (chi2 u v) w = true →
+    wireVal C (chi1 u) w = true ∨ wireVal C (chi1 v) w = true ∨ G.Adj u v
+
+theorem PairSafe_of_edgeSupport {n : ℕ} {G : SimpleGraph (Fin n)} {C : Circuit} {w : ℕ}
+    (h : PairSafe G C w) {u v : Fin n} (huv : u ≠ v)
+    (h2 : wireVal C (chi2 u v) w = true)
+    (h1u : wireVal C (chi1 u) w = false)
+    (h1v : wireVal C (chi1 v) w = false) :
+    G.Adj u v := by
+  have := h u v huv h2
+  simp [h1u, h1v] at this
+  exact this
+
+theorem PairSafe_input {n : ℕ} (G : SimpleGraph (Fin n)) (C : Circuit) (i : Fin n) :
+    PairSafe G C i.val := by
+  intro u v huv h2
+  have h2' : chi2 u v i = true := by
+    simpa [wireVal_input C (chi2 u v) i] using h2
+  have : i = u ∨ i = v := of_decide_eq_true (by simpa [chi2] using h2')
+  cases this with
+  | inl h =>
+    left
+    simp [wireVal_input, chi1, h]
+  | inr h =>
+    right; left
+    simp [wireVal_input, chi1, h]
+
+theorem PairSafe_output {n : ℕ} {G : SimpleGraph (Fin n)} {C : Circuit}
+    (hF : ∀ x : Fin n → Bool,
+      C.eval (List.ofFn x) = true ↔ ∃ u v : Fin n, G.Adj u v ∧ x u = true ∧ x v = true) :
+    PairSafe G C C.output := by
+  intro u v huv h2
+  have heval : C.eval (List.ofFn (chi2 u v)) = true := by
+    simpa [wireVal, Circuit.eval] using h2
+  obtain ⟨a, b, hab, ha, hb⟩ := (hF _).mp heval
+  have ha' : a = u ∨ a = v := of_decide_eq_true (by simpa [chi2] using ha)
+  have hb' : b = u ∨ b = v := of_decide_eq_true (by simpa [chi2] using hb)
+  cases ha' with
+  | inl hau =>
+    cases hb' with
+    | inl hbu =>
+      exact absurd (hau.trans hbu.symm) hab.ne
+    | inr hbv =>
+      right; right
+      exact hau ▸ hbv ▸ hab
+  | inr hav =>
+    cases hb' with
+    | inl hbu =>
+      right; right
+      exact (hav ▸ hbu ▸ hab).symm
+    | inr hbv =>
+      exact absurd (hav.trans hbv.symm) hab.ne
+
+theorem star_cover_total (m k : ℕ) (_hk : 0 < k) (_hkm : k ≤ m) :
+    (m - k) + k + (k - 1) = m + k - 1 := by
+  omega
+
+theorem gate_isAnd_iff (g : Gate) :
+    isAnd g = true ↔ g.op = GateOp.and := by
+  cases g with
+  | mk op inputs => cases op <;> simp [isAnd]
+
+theorem gate_isOr_iff (g : Gate) :
+    isOr g = true ↔ g.op = GateOp.or := by
+  cases g with
+  | mk op inputs => cases op <;> simp [isOr]
+
+/-- Under `Monotone2`, every gate is tagged by exactly one of `isAnd` / `isOr`. -/
+theorem monotone2_isAnd_or_isOr {C : Circuit} (h : Monotone2 C) {g : Gate}
+    (hg : g ∈ C.gates) : isAnd g = true ∨ isOr g = true := by
+  rcases monotone2_op h g hg with hA | hO
+  · left; exact (gate_isAnd_iff g).mpr hA
+  · right; exact (gate_isOr_iff g).mpr hO
+
 end PEqualNP.Outside.L_meta_612_aux
-
-
-
