@@ -101,14 +101,14 @@ theorem min_cover_private {n : ℕ} {G : SimpleGraph (Fin n)} {S : Finset (Fin n
     intro a b hab
     have hab' := hS a b hab
     by_cases has : a = s
-    · subst has
-      have hbS : b ∈ S := hnone b hab
-      have hbne : b ≠ s := hab.ne.symm
+    · have hbS : b ∈ S := hnone b (has ▸ hab)
+      have hbne : b ≠ s := by
+        intro heq; exact hab.ne (has.trans heq.symm)
       exact Or.inr (Finset.mem_erase.mpr ⟨hbne, hbS⟩)
     · by_cases hbs : b = s
-      · subst hbs
-        have haS : a ∈ S := hnone a hab.symm
-        have hane : a ≠ s := hab.ne
+      · have haS : a ∈ S := hnone a (hbs ▸ hab.symm)
+        have hane : a ≠ s := by
+          intro heq; exact hab.ne (heq.trans hbs.symm)
         exact Or.inl (Finset.mem_erase.mpr ⟨hane, haS⟩)
       · rcases hab' with ha | hb
         · exact Or.inl (Finset.mem_erase.mpr ⟨has, ha⟩)
