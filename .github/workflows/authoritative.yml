@@ -122,8 +122,9 @@ jobs:
           # The statement comes from the desk's public list, never from the pull request.
           curl -sSf --proto '=https' --max-redirs 0 --max-filesize 5000000 -o "$W/in/gaps.json" "$GAPS_URL"
           node "$W/base/.github/scripts/outside-guard.mjs" gap "$W/in/gaps.json" "$GAP" "$(cat "$W/in/pr.file")" "$W/in"
-          # Before anything is built: the file may import Mathlib and the modules the gap lists.
-          node "$W/base/.github/scripts/outside-guard.mjs" imports "$W/in/proof.lean" "$W/in/imports.json"
+          # Before anything is built: the file may import Mathlib and the modules the gap lists,
+          # and every helper sits inside the file's own namespace (named from its path).
+          node "$W/base/.github/scripts/outside-guard.mjs" imports "$W/in/proof.lean" "$W/in/imports.json" "$(cat "$W/in/pr.file")"
           # A listed module may itself be outside-written (under PEqualNP.Outside, merged on the
           # base). Such a module runs code when it compiles, like the judged file, so it is never
           # built before the locked step. This splits what the listed modules import, read as
@@ -293,7 +294,34 @@ jobs:
           limit=$(( 1200 + 240 * $(grep -c . "$W/in/outside-imports.txt" || true) ))
           [ "$limit" -le 2700 ] || limit=2700
           echo "time limit for the checker: $limit s"
-          sudo systemd-run --quiet --scope --collect -p MemoryMax="${cap}K" \
+          # THE MEMORY WATCH (2026-11-23: three public runs lost their machine in this step and left
+          # no log). Every 60 s ONE line goes to this step's own output, which GitHub shows live, so a
+          # lost machine leaves its last numbers on the page: the machine's available memory, swap in
+          # use, the checker's memory now and at its peak (its own cgroup, the scope named below).
+          # And the machine is never lost silently: when the MACHINE itself runs short (available
+          # memory under 5 percent of all of it for two samples in a row, or memory pressure 'full'
+          # over 40 percent for the last minute), the watch ends the checker and the verdict step
+          # reports a FAULT with that line. Not at 90 percent of the checker's own limit: under a
+          # hard limit the checker works at its limit and swaps, which is how a heavy honest proof
+          # passes; it is the machine running short that loses a runner.
+          unit="pnp-check-$GITHUB_RUN_ID"
+          cg="/sys/fs/cgroup/system.slice/$unit.scope"
+          ( low=0
+            while sleep 60; do
+              total=$(awk '/^MemTotal:/{print $2}' /proc/meminfo); avail=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo)
+              swap=$(awk '/^SwapTotal:/{t=$2} /^SwapFree:/{f=$2} END{print t-f}' /proc/meminfo)
+              now=$(cat "$cg/memory.current" 2>/dev/null || echo 0); peak=$(cat "$cg/memory.peak" 2>/dev/null || echo 0)
+              full=$(awk '/^full/{for(i=1;i<=NF;i++) if($i ~ /^avg60=/){sub("avg60=","",$i); print int($i)}}' /proc/pressure/memory 2>/dev/null || echo 0)
+              echo "memory watch t=$(( $(date +%s) - t0 ))s: available $((avail / 1024)) MB of $((total / 1024)), swap used $((swap / 1024)) MB, checker now $((now / 1048576)) MB, peak $((peak / 1048576)) MB of $((cap / 1024)), pressure full $full%"
+              if [ "$avail" -lt $((total / 20)) ]; then low=$((low + 1)); else low=0; fi
+              if [ "$low" -ge 2 ] || [ "${full:-0}" -gt 40 ]; then
+                echo "memory watch: the MACHINE is running short (available $((avail / 1024)) MB, pressure full $full%): ending the checker before the runner is lost" | tee -a "$RUNNER_TEMP/checker.err"
+                sudo systemctl kill --signal=KILL "$unit.scope" 2>/dev/null || true
+                break
+              fi
+            done ) &
+          watch=$!
+          sudo systemd-run --quiet --scope --collect --unit="$unit" -p MemoryMax="${cap}K" \
               --uid="$(id -u)" --gid="$(id -g)" \
           taskset -c 0,1 env -i HOME="$HOME" LANG=C.UTF-8 PATH="$TC_BIN:$node_bin:/usr/bin:/bin" \
               PEQUALNP_REAL_LAKE="$W/base/.github/scripts/lake-locked.sh" PEQUALNP_HOME="$W/queue" \
@@ -301,9 +329,14 @@ jobs:
             timeout -k 30 "$limit" node "$W/base/tools/check-lean.mjs" "$W/base/$file" "$W/in/statement.txt" check \
             > "$RUNNER_TEMP/checker.out" 2> "$RUNNER_TEMP/checker.err"
           code=$?
-          kill "$sampler" 2>/dev/null
-          # 124 or 137: the time limit ended the checker. A FAULT, never a verdict on the proof.
-          case "$code" in 124|137) echo "the checker was stopped after $limit seconds" >> "$RUNNER_TEMP/checker.err" ;; esac
+          kill "$sampler" "$watch" 2>/dev/null
+          # Ended by the memory watch: a FAULT of the machine, never a verdict on the proof.
+          if grep -q '^memory watch: the MACHINE is running short' "$RUNNER_TEMP/checker.err" 2>/dev/null; then
+            code=137
+          else
+            # 124 or 137: the time limit ended the checker. A FAULT, never a verdict on the proof.
+            case "$code" in 124|137) echo "the checker was stopped after $limit seconds" >> "$RUNNER_TEMP/checker.err" ;; esac
+          fi
           # Nothing the compile started may outlive it, and neither may the verifier.
           sudo pkill -KILL -u outsider || true
           pkill -KILL -f "$W/base/lean/.lake/build/bin/checklemma" || true

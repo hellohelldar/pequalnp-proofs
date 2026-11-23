@@ -6,7 +6,7 @@
 //   node outside-guard.mjs pr <pr.json> <files.json> <tree.json> <repo> <default branch> <out dir>
 //   node outside-guard.mjs gap <gaps.json> <gap id> <file path> <out dir>
 //   node outside-guard.mjs gap-of-file <gaps.json> <file path> <out dir>
-//   node outside-guard.mjs imports <lean file> <imports.json>
+//   node outside-guard.mjs imports <lean file> <imports.json> <file path in the pull request>
 //   node outside-guard.mjs closure <base dir> <imports.json> <judged file path> <out dir>
 //
 // Exit 0: the guard holds. Exit 1: REFUSED, with one line saying why. Exit 3: bad usage.
@@ -121,7 +121,7 @@ const FORBIDDEN = new RegExp([
   '|' + B + 'axiom' + A + '|' + B + 'opaque' + A + String.raw`|unsafe|` + B + 'partial' + A + String.raw`|sorry|` + B + 'admit' + A,
   String.raw`|#[a-z_][a-z_]{2,}|implemented_by|extern`,
   String.raw`|` + '`' + String.raw`\([a-z]+\||\$\(|%\[|@\[|register_|declare_|lcProof|lcUnreachable|` + B + 'infix|' + B + 'prefix' + A + '|' + B + 'postfix' + A,
-  String.raw`|set_option|binder_predicate|unif_hint|^\s*add_\w+|unseal|compile_inductive|irreducible_def`,
+  String.raw`|set_option|binder_predicate|unif_hint|^\s*add_\w+|unseal|compile_inductive|irreducible_def|proof_wanted|mk_iff_of_inductive_prop`,
 ].join(''), 'u');
 // The four limit options, wherever they stand, are taken out before the list is asked; every
 // other set_option, at column 0 or indented, is refused by it.
@@ -136,10 +136,99 @@ export function checkPlain(text) {
   text.split('\n').forEach((raw, k) => {
     const line = raw.replace(/\r$/, '');
     const m = FORBIDDEN.exec(line.replace(LIMIT, '').replace(/@\[(local )?simp\]/gu, ''));
-    if (m) refuse(`line ${k + 1}: "${m[0].trim()}" is not allowed in a proof file, in code or in a comment (no code that runs at build time, no new syntax, no string literals, no attributes but simp, no options but the four limits)`);
+    // A line that BEGINS with a name starting add_ reads like one of the library's add_ commands.
+    // An honest proof line can begin with such a lemma name: the sentence says the way round.
+    const hint = m && /^add_/.test(m[0].trim()) ? '; a line may not BEGIN with a name that starts with add_ (the library\'s commands do): if this is a lemma of yours used in a proof, put it after other text on the line or rename it' : '';
+    if (m) refuse(`line ${k + 1}: "${m[0].trim()}" is not allowed in a proof file, in code or in a comment (no code that runs at build time, no new syntax, no string literals, no attributes but simp, no options but the four limits)${hint}`);
     if (/^\s*(@\[(local )?simp\] )?((private|protected) )?theorem /u.test(line)) theorems += 1;
   });
   if (theorems === 0) refuse('the file holds no theorem');
+}
+
+// THE OWN-NAMESPACE RULE, for the file of a NEW pull request only (merged files are never edited,
+// so the closure check below does not apply it to listed modules). Every helper of the file sits
+// inside a namespace block named after the file, so two outside files, or an outside file and the
+// project's own modules, can always be imported together (a file that copied project modules
+// under the project's namespaces once could not be). For lean/PEqualNP/Outside/L_x.lean, M is
+// PEqualNP.Outside.L_x, and at the top level (outside every block) the only code lines are:
+//   import lines; `open ...` lines; the four limit options (`set_option <limit> <n> in`);
+//   `namespace N` where N is M, M.<more>, M_aux or M_aux.<more>; the one theorem, written
+//   `theorem M ...` with its full name, last: after it only its proof (no command word).
+// Inside such a block anything the other rules allow. `namespace`, `section`, `end` and `mutual`
+// stand alone at column 0 (an indented one is refused), so the depth is read line by line; each
+// `end` names exactly what it closes. A line is read with its comments blanked: Lean ignores them.
+// Private declarations at the top level are refused too: one simple rule, and a private helper
+// moves into the block with two lines. KNOWN LIMITS: instances and simp lemmas inside the block
+// still act in every importer (names are safe, behaviour is not); after the theorem the proof is
+// searched for a list of command words, and a command word the list misses would meet the build.
+const ID = String.raw`[\p{L}_][\p{L}\p{N}_'!?]*(?:\.[\p{L}_][\p{L}\p{N}_'!?]*)*`;
+const W = (words) => new RegExp(String.raw`(?<![\p{L}\p{N}_.'!?])(?:${words})(?![\p{L}\p{N}_'!?])`, 'u');
+const SCOPE_WORD = W('namespace|section|end|mutual');
+const SCOPE_LINE = new RegExp(String.raw`^(?:(namespace) (${ID})|(noncomputable section|section)(?: (${ID}))?|(end)(?: (${ID}))?|(mutual))[ \t]*$`, 'u');
+const AFTER_THEOREM = W('def|theorem|lemma|abbrev|instance|structure|class|inductive|coinductive|example|opaque|axiom|noncomputable|private|protected|partial|unsafe|variable|universe|attribute|export|deriving|alias|local|scoped|omit|include|mk_iff_of_inductive_prop');
+const TOP_LIMIT = /^set_option (maxRecDepth|maxHeartbeats|synthInstance\.maxSize|synthInstance\.maxHeartbeats) [0-9]+ in[ \t]*$/u;
+
+// The text with every comment blanked (same length, line breaks kept). No string literal can
+// stand in a file that passed checkPlain, so a comment opener is always one.
+export function blankComments(text) {
+  let out = '', i = 0, depth = 0;
+  const blank = (s) => s.replace(/[^\n]/g, ' ');
+  while (i < text.length) {
+    if (depth > 0) {
+      if (text.startsWith('/-', i)) { depth += 1; out += '  '; i += 2; } else if (text.startsWith('-/', i)) { depth -= 1; out += '  '; i += 2; } else { out += blank(text[i]); i += 1; }
+    } else if (text.startsWith('/-', i)) { depth = 1; out += '  '; i += 2; }
+    else if (text.startsWith('--', i)) { const j = text.indexOf('\n', i); const e = j < 0 ? text.length : j; out += blank(text.slice(i, e)); i = e; }
+    else { out += text[i]; i += 1; }
+  }
+  return out;
+}
+
+export function checkOwnNamespace(text, module) {
+  if (!OUTSIDE_MODULE_RE.test(module)) refuse(`${module} is not the module of an outside proof file`);
+  if (module.endsWith('_aux')) refuse('the file name may not end in _aux (that suffix names the helper namespace of another file)');
+  const own = (n) => n === module || n.startsWith(`${module}.`) || n === `${module}_aux` || n.startsWith(`${module}_aux.`);
+  const fix = `put every helper inside \`namespace ${module}\` ... \`end ${module}\`; only the imports and the theorem stay outside`;
+  const stack = [];
+  let theorem = false;
+  blankComments(text).split('\n').forEach((raw, k) => {
+    const code = raw.replace(/\r$/, '').replace(/[ \t]+$/, '');
+    if (code.trim() === '') return;
+    const at = `line ${k + 1}`;
+    if (SCOPE_WORD.test(code)) {
+      const m = SCOPE_LINE.exec(code);
+      if (!m) refuse(`${at}: \`namespace\`, \`section\`, \`end\` and \`mutual\` must stand alone at the start of a line (not indented, nothing else on it); ${fix}`);
+      if (theorem) refuse(`${at}: nothing but the proof may follow the theorem ${module}; ${fix}`);
+      if (m[1]) {
+        if (stack.length === 0 && !own(m[2])) refuse(`${at}: \`namespace ${m[2]}\` at the top level; the only namespace allowed there is the file's own; ${fix}`);
+        stack.push({ kind: 'namespace', name: m[2] });
+      } else if (m[3]) {
+        if (stack.length === 0) refuse(`${at}: a section at the top level; open it inside the file's own namespace; ${fix}`);
+        stack.push({ kind: 'section', name: m[4] });
+      } else if (m[7]) {
+        if (stack.length === 0) refuse(`${at}: \`mutual\` at the top level; ${fix}`);
+        stack.push({ kind: 'mutual' });
+      } else {
+        const top = stack.pop();
+        if (!top) refuse(`${at}: \`end\` with nothing open to close; ${fix}`);
+        if (top.kind === 'mutual' ? m[6] !== undefined : m[6] !== top.name) refuse(`${at}: \`end${m[6] ? ` ${m[6]}` : ''}\` does not name what it closes (${top.kind === 'mutual' ? '`end` alone closes `mutual`' : `write \`end${top.name ? ` ${top.name}` : ''}\``})`);
+      }
+      return;
+    }
+    if (theorem) {
+      const w = AFTER_THEOREM.exec(code);
+      if (w) refuse(`${at}: "${w[0]}" after the theorem ${module}; nothing but its proof may follow it; ${fix}`);
+      return;
+    }
+    if (stack.length > 0) return;
+    if (/^import [^ \t]+$/u.test(code) || TOP_LIMIT.test(code)) return;
+    if (/^open[ \t]/u.test(code)) {
+      if (/[ \t]in[ \t]+\S/u.test(code)) refuse(`${at}: an \`open ... in\` line must end with \`in\`, with the theorem on the next line; ${fix}`);
+      return;
+    }
+    if (new RegExp(String.raw`^theorem ${module.replace(/\./g, '\\.')}(?![\p{L}\p{N}_'!?.])`, 'u').test(code)) { theorem = true; return; }
+    refuse(`${at}: a declaration or command outside the file's own namespace (at the top level only imports, \`open\` lines, the four limit options, \`namespace ${module}\` and \`theorem ${module}\` may stand); ${fix}`);
+  });
+  if (!theorem) refuse(`the theorem must stand at the top level, last, written with its full name: \`theorem ${module} ...\`; ${fix}`);
 }
 
 // WHAT THE BASE STEP MAY BUILD. A gap may list modules that outsiders wrote (anything under
@@ -250,8 +339,11 @@ const main = () => {
     put(out, 'statement.txt', g.statement);          // the posted text, byte for byte
     put(out, 'imports.json', JSON.stringify(g.imports));
     put(out, 'imports.txt', g.imports.map((m) => `${m}\n`).join(''));
-  } else if (cmd === 'imports' && a.length === 2) {
-    const seen = checkImports(readFileSync(a[0]), json(a[1]));
+  } else if (cmd === 'imports' && a.length === 3) {
+    if (!FILE_RE.test(a[2])) refuse('the file must be lean/PEqualNP/Outside/L_<gap>.lean');
+    const bytes = readFileSync(a[0]);
+    const seen = checkImports(bytes, json(a[1]));
+    checkOwnNamespace(new TextDecoder().decode(bytes), moduleOf(a[2]));
     process.stdout.write(`imports allowed: ${seen.join(' ') || '(none)'}\n`);
   } else if (cmd === 'closure' && a.length === 4) {
     const [baseDir, importsPath, judgedFile, out] = a;
